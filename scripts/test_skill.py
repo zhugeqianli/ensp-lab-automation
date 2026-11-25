@@ -182,6 +182,105 @@ def apply_plan_checks():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def apply_plan_regression_checks():
+    """P0 回归：不重放命令 / ping 缺 target 退 2 / 报告写不了退 2 / 主机名不一致不下发。"""
+    section("[apply_plan] P0 regressions")
+    import contextlib
+    import io
+    import json
+    import apply_plan as ap
+
+    tmp = workdir()
+    try:
+        def run(args):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = ap.main(args)
+            return code, out.getvalue(), err.getvalue()
+
+        def write_plan(name, plan):
+            path = os.path.join(tmp, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(plan, fh)
+            return path
+
+        def new_fake(sysname=None):
+            fake = test_offline.FakeVRP()
+            if sysname:
+                fake.sysname = sysname
+            fake.start()
+            time.sleep(0.2)
+            return fake
+
+        # --- P0-1：整段下发报错后不许重放（旧行为会把全部 lines 再发一遍）
+        fake = new_fake()
+        path = write_plan("p0-1.json", {"devices": [{
+            "name": "R1", "port": fake.port,
+            "lines": ["system-view", "bogus-command-xyz", "return"],
+        }], "save": False})
+        rc, console, _ = run([path])
+        check("P0-1 malformed line: exits 1", rc == 1, "rc=%s" % rc)
+        count = fake.history.count("bogus-command-xyz")
+        check("P0-1 malformed line sent exactly once (no replay)", count == 1,
+              "sent %d times; history=%s" % (count, fake.history[:10]))
+        check("P0-1 replay is off: system-view not re-sent",
+              fake.history.count("system-view") <= 1,
+              "system-view x%d" % fake.history.count("system-view"))
+        check("P0-1 error still reported", "[FAIL]" in console, console[-200:])
+
+        # --- P0-2：ping 断言缺 target 属于计划问题 → 退 2，且不许碰设备
+        fake2 = new_fake()
+        path2 = write_plan("p0-2.json", {"devices": [{
+            "name": "R1", "port": fake2.port,
+            "lines": ["system-view", "return"],
+            "expect": [{"name": "PC1 通", "ping": {"max_loss": 0}}],
+        }], "save": False})
+        rc2, console2, _ = run([path2])
+        check("P0-2 ping without target: exits 2", rc2 == 2, "rc=%s" % rc2)
+        check("P0-2 ping without target: says why", "target" in console2, console2[-200:])
+        check("P0-2 ping without target: device untouched",
+              "system-view" not in fake2.history, str(fake2.history[:6]))
+
+        # --- P0-3：报告写不进磁盘 → 退 2（以前静默返回 0/1）
+        fake3 = new_fake()
+        path3 = write_plan("p0-3.json", {"devices": [{
+            "name": "R1", "port": fake3.port, "lines": ["system-view", "return"],
+        }], "save": False})
+        bad_report = os.path.join(tmp, "no-such-dir", "report.txt")
+        rc3, console3, err3 = run([path3, "--report", bad_report])
+        check("P0-3 unwritable report: exits 2", rc3 == 2, "rc=%s" % rc3)
+        check("P0-3 unwritable report: announced on stderr", "写不了" in err3, err3[-200:])
+        check("P0-3 unwritable report: no false '已写入' success claim",
+              "文本报告已写入 %s" % bad_report not in console3, console3[-160:])
+
+        # --- P0-4：提示符主机名与计划名不一致 → 默认跳过，不下发、不 save
+        fake4 = new_fake(sysname="R9")
+        path4 = write_plan("p0-4.json", {"devices": [{
+            "name": "R1", "port": fake4.port,
+            "lines": ["system-view", "sysname R1", "return"],
+        }], "save": True})
+        rc4, console4, _ = run([path4])
+        check("P0-4 hostname mismatch: exits 1", rc4 == 1, "rc=%s" % rc4)
+        check("P0-4 hostname mismatch: nothing pushed",
+              "sysname R1" not in fake4.history, str(fake4.history[:8]))
+        check("P0-4 hostname mismatch: not saved", fake4.saved is False, str(fake4.saved))
+        check("P0-4 hostname mismatch: explains the skip",
+              "--allow-name-mismatch" in console4, console4[-200:])
+
+        # --- 逃生开关确实有效（否则那个 flag 就是个安慰剂）
+        fake5 = new_fake(sysname="R9")
+        path5 = write_plan("p0-4b.json", {"devices": [{
+            "name": "R1", "port": fake5.port,
+            "lines": ["system-view", "sysname R1", "return"],
+        }], "save": False})
+        rc5, _, _ = run([path5, "--allow-name-mismatch"])
+        check("P0-4 --allow-name-mismatch does push", "sysname R1" in fake5.history,
+              str(fake5.history[:8]))
+        check("P0-4 --allow-name-mismatch exits 0", rc5 == 0, "rc=%s" % rc5)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def lab_spec_checks():
     """lab.json：校验、编译成计划、直接生成工程。"""
     section("[lab_spec] spec -> topology / plan / topo")
@@ -490,6 +589,7 @@ def main(argv=None):
 
     smoke_checks()
     apply_plan_checks()
+    apply_plan_regression_checks()
     console_checks()
     index_checks()
     if args.topos:

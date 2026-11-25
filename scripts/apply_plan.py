@@ -2,8 +2,13 @@
 """按 JSON 计划批量下发配置 + 断言 + 出报告：一遍到位，成功与否有据可查。
 
 为什么不用「一条条 cmd」：每行都要等一次空闲超时（≈0.5s），40 行就 20s+；
-而 paste 一把写完再读只要 1~2s。但 paste 出错时难定位，所以这里用
-「整段 paste → 复查 → 只把失败的行单独重放」的折中方式。
+而 paste 一把写完再读只要 1~2s。整段 paste 的代价是报错时定位不到具体行 ——
+`_clean_bulk()` 已经把回显剥掉了，剩下的只有输出。
+
+**这里刻意不做「失败行重放」**：重放会把已经成功执行过的非幂等命令再跑一遍
+（成对的 `undo` / `vlan batch` / 先 undo 再配的写法），最终状态取决于重放顺序，
+不可预测；比"少一条定位信息"贵得多。报错行原样进报告（标 `(整段下发)`），
+要精确到行就把那一段拆小重发。
 
 计划文件格式：
 {
@@ -84,8 +89,13 @@ def run_expect(con, expects):
         name = _expect_label(exp)
         try:
             if "ping" in exp:
-                p = exp["ping"]
-                ok, loss, rtt = con.ping(p["target"], source=p.get("source"),
+                p = exp.get("ping") or {}
+                target = p.get("target")
+                if not target:
+                    results.append({"name": name, "ok": False,
+                                    "detail": "ping 断言缺少 target"})
+                    continue
+                ok, loss, rtt = con.ping(str(target), source=p.get("source"),
                                          count=int(p.get("count", 4)))
                 max_loss = float(p.get("max_loss", 0))
                 passed = bool(ok) and loss <= max_loss
@@ -109,15 +119,16 @@ def run_expect(con, expects):
                 else:
                     passed, detail = False, "expect 需要 contains/not_contains/regex/ping"
                 if not passed:
-                    detail += " | 输出首行: %r" % (out.strip().splitlines()[:1])
-        except VRPError as exc:
-            passed, detail = False, "命令失败: %s" % exc
+                    first = (out.strip().splitlines() or ["(空输出)"])[0]
+                    detail += " | 输出首行: %s" % first
+        except Exception as exc:  # 断言本身出问题（缺字段、类型错）也不能崩掉整轮
+            passed, detail = False, "命令失败: %s: %s" % (type(exc).__name__, exc)
         results.append({"name": name, "ok": passed, "detail": "" if passed else detail})
     return results
 
 
 # ---------------------------------------------------------------- 单台
-def apply_one(item, ports, save=True, dry=False):
+def apply_one(item, ports, save=True, dry=False, allow_name_mismatch=False):
     """下发一台设备，返回结构化结果（不抛异常，失败写进结果里）。"""
     name = item.get("name") or "(unnamed)"
     result = {
@@ -146,30 +157,31 @@ def apply_one(item, ports, save=True, dry=False):
         con.wait_ready(timeout=180)
         seen = con.hostname()
         if seen and seen.lower() != name.lower():
+            # 默认严格：主机名对不上就不碰这台设备。多工程并行（--base-port 分段）
+            # 或 eNSP 复用端口时，继续下发等于把 A 实验的配置写进 B 实验并 save。
             result["notes"].append(
-                "提示符主机名 %r 与计划名 %r 不一致（已继续，请确认端口没串）" % (seen, name))
+                "提示符主机名 %r 与计划名 %r 不一致：已跳过该设备，未下发、未 save"
+                "（多半是端口串台；确认无误确实要强推请加 --allow-name-mismatch）"
+                % (seen, name))
+            if not allow_name_mismatch:
+                return result
+            result["notes"].append("--allow-name-mismatch 已开启，按计划名继续下发")
         con.return_to_user_view()
         con.quiet_logs()
         con.disable_paging()
 
-        # 一段发完；先看这段回显里有没有报错行
+        # 一段发完；只看这段回显里有没有报错行。
+        # 注意：这里绝不逐行重放 —— 重放会把非幂等命令（成对 undo / vlan batch /
+        # 先 undo 再配）再执行一遍。宁可丢失"哪一行错"的定位，也不动第二次设备。
         body = con.paste(lines, timeout=120, allow_error=True)
         bad = [l.strip() for l in body.splitlines() if ERROR_RE.search(l)]
         if bad:
-            result["notes"].append("整段下发有 %d 行报错，逐行重放定位" % len(bad))
-            con.return_to_user_view()
-            for line in lines:
-                try:
-                    out = con.cmd(line, timeout=40, allow_error=True)
-                except VRPError as exc:
-                    result["error_lines"].append({"line": line,
-                                                  "error": str(exc)[-120:]})
-                    continue
-                for err in out.splitlines():
-                    if ERROR_RE.search(err):
-                        result["error_lines"].append({"line": line,
-                                                      "error": err.strip()})
-                        break
+            result["notes"].append(
+                "整段下发有 %d 行报错；未重放任何命令（重放会重复执行非幂等命令）"
+                "，报错原文见下面的 [FAIL] 行" % len(bad))
+            for err in bad:
+                result["error_lines"].append({"line": "(整段下发)",
+                                              "error": err[:200]})
 
         con.return_to_user_view()
         if save:
@@ -268,6 +280,18 @@ def render_md(results, plan_path):
 
 
 # ---------------------------------------------------------------- 入口
+def _write_report(path, content, label):
+    """写一份报告；失败要报出来，不能像以前那样打印"已写入"其实没写。"""
+    try:
+        with io.open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except OSError as exc:
+        print("写不了%s %s: %s" % (label, path, exc), file=sys.stderr)
+        return False
+    print("%s已写入 %s" % (label, path))
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="按计划批量下发配置 + 断言 + 报告")
     ap.add_argument("plan", nargs="?", default="", help="计划 JSON（或用 --spec lab.json）")
@@ -277,6 +301,8 @@ def main(argv=None):
     ap.add_argument("--md", default="", help="Markdown 报告输出文件")
     ap.add_argument("--dry-run", action="store_true", help="只打印要下发/断言的内容")
     ap.add_argument("--no-save", action="store_true", help="下发后不 save")
+    ap.add_argument("--allow-name-mismatch", action="store_true",
+                    help="提示符主机名与计划名不一致时仍然下发（默认跳过该设备）")
     args = ap.parse_args(argv)
 
     if args.spec:
@@ -303,6 +329,19 @@ def main(argv=None):
         print("计划里没有 devices。")
         return 2
 
+    # 计划静态校验：ping 断言缺 target 属于"计划有问题"，先拦在动设备之前。
+    # 以前会走到 run_expect 里抛 KeyError，整轮崩掉并且一份报告都不写。
+    broken = []
+    for item in devices:
+        for exp in item.get("expect") or []:
+            if "ping" in exp and not (exp.get("ping") or {}).get("target"):
+                broken.append("%s: %s" % (item.get("name", "?"), _expect_label(exp)))
+    if broken:
+        print("计划里的 ping 断言缺少 target：")
+        for b in broken:
+            print("  " + b)
+        return 2
+
     save = plan.get("save", True) and not args.no_save
     explicit = all(d.get("port") for d in devices)
     ports = [] if explicit else scan_ports()
@@ -316,30 +355,40 @@ def main(argv=None):
 
     results = []
     for item in devices:
-        r = apply_one(item, ports, save=save, dry=args.dry_run)
+        try:
+            r = apply_one(item, ports, save=save, dry=args.dry_run,
+                          allow_name_mismatch=args.allow_name_mismatch)
+        except Exception as exc:  # 单台崩掉不影响其它设备，也不能让报告丢失
+            r = {"device": item.get("name") or "(unnamed)", "port": item.get("port"),
+                 "ok": False, "dry_run": args.dry_run, "lines": 0, "error_lines": [],
+                 "save": None, "expects": [], "verify": [],
+                 "notes": ["执行时抛出异常: %s: %s" % (type(exc).__name__, exc)]}
         results.append(r)
         print("\n".join(device_text(r)))
         print("")
         time.sleep(0.2)
 
     text = render_text(results, plan_label)
+    write_failed = False
     if args.report:
-        io.open(args.report, "w", encoding="utf-8").write(text + "\n")
-        print("文本报告已写入 %s" % args.report)
+        write_failed |= not _write_report(args.report, text + "\n", "文本报告")
     if args.json:
-        io.open(args.json, "w", encoding="utf-8").write(
+        write_failed |= not _write_report(
+            args.json,
             json.dumps({"plan": plan_label, "results": results,
                         "ok": all(r["ok"] for r in results)},
-                       ensure_ascii=False, indent=2) + "\n")
-        print("JSON 报告已写入 %s" % args.json)
+                       ensure_ascii=False, indent=2) + "\n",
+            "JSON 报告")
     if args.md:
-        io.open(args.md, "w", encoding="utf-8").write(render_md(results, plan_label))
-        print("Markdown 报告已写入 %s" % args.md)
+        write_failed |= not _write_report(args.md, render_md(results, plan_label),
+                                          "Markdown 报告")
 
     all_ok = all(r["ok"] for r in results)
     passed = sum(1 for r in results if r["ok"])
     print("结论: %d/%d 台通过%s" % (passed, len(results),
                                   "" if all_ok else "，看上面的 FAIL"))
+    if write_failed:
+        return 2  # 报告没落盘 = 证据丢了，不能报"成功"
     return 0 if all_ok else 1
 
 

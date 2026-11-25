@@ -41,6 +41,7 @@ class FakeVRP(threading.Thread):
         self.saved = False
         self.pending_save = False
         self.paging_sent = False
+        self.history = []  # every non-empty command line received (回放/重复执行自证用)
 
     def prompt(self):
         return "%s%s" % (self.sysname, ">" if self.view == "user" else "]")
@@ -84,6 +85,8 @@ class FakeVRP(threading.Thread):
 
     def handle(self, conn, line):
         cmd = line.strip()
+        if cmd:
+            self.history.append(cmd)
         if self.pending_save:
             if cmd.lower() in ("y", "yes"):
                 self.saved = True

@@ -2,7 +2,7 @@
 name: ensp-lab-automation
 slug: ensp-lab-automation
 displayName: eNSP 实验自动化（华为网络实验）
-version: 1.0.0
+version: 1.0.1
 summary: 让 AI 在华为 eNSP 里自动完成网络实验：生成/校验 .topo 工程、console 批量下发 VRP 配置并 save、ping 与接口计数断言、txt/json/md 三份报告与可判定的退出码。
 description: 在华为 eNSP 中自动完成网络实验：生成/解析 .topo 工程、console 批量下发 VRP 配置并 save、ping/接口计数验证、排障、按试卷拓扑图复现画布。覆盖静态/默认/聚合/浮动路由、串口、S3700、PC 取证、拓扑图 OCR。用户要求用 eNSP 组网/路由/交换实验、批量配置或排连通性时使用。
 license: MIT
