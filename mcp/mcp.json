@@ -1,0 +1,11 @@
+{
+  "_comment": "把 <SKILL_DIR> 换成技能的本机绝对路径（含 ensp-lab-automation 目录），或直接复制本文件为 mcp.local.json 再改。示例：C:/Users/you/.dsh/skills/ensp-lab-automation",
+  "mcpServers": {
+    "ensp": {
+      "command": "python",
+      "args": [
+        "<SKILL_DIR>/mcp/ensp_mcp_server.py"
+      ]
+    }
+  }
+}
